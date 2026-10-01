@@ -83,6 +83,29 @@ export async function replaceShotFrames(shotId: number, frames: FrameEntry[]): P
   });
 }
 
+/**
+ * 一次性提交帧序保存（并发保护的落库收口）。
+ * 在同一个读写事务内完成：删除多余帧、upsert 帧条目、回写镜头帧区间 / 时长 / 修订号。
+ * 事务任一步抛错即整体回滚，避免帧条目与镜头区间不一致。
+ */
+export async function commitFrameSequence(
+  shotId: number,
+  frames: FrameEntry[],
+  shotPatch: Partial<Shot>,
+): Promise<void> {
+  const plainFrames = frames.map((f) => toPlain(f));
+  await db.transaction('rw', db.frames, db.shots, async () => {
+    const keepIds = new Set(
+      plainFrames.map((f) => f.id).filter((id): id is number => typeof id === 'number'),
+    );
+    const existingIds = await db.frames.where('shotId').equals(shotId).primaryKeys();
+    const stale = existingIds.filter((id) => !keepIds.has(id));
+    if (stale.length) await db.frames.bulkDelete(stale);
+    if (plainFrames.length) await db.frames.bulkPut(plainFrames);
+    await db.shots.update(shotId, toPlain({ ...shotPatch, updatedAt: Date.now() }));
+  });
+}
+
 /* ---------------- props ---------------- */
 
 export async function listProps(shotId: number): Promise<PropState[]> {

@@ -24,38 +24,27 @@ export function useFrameSequence() {
   async function insertAfter(frameNo: number | null) {
     const index = frameNo === null ? frames.value.length : frames.value.findIndex((f) => f.frameNo === frameNo) + 1;
     await frameStore.insertAt(Math.max(0, index));
-    await syncShotRange();
   }
 
   async function removeAt(frameNo: number) {
     const index = frames.value.findIndex((f) => f.frameNo === frameNo);
     if (index < 0) return;
     await frameStore.removeAt(index);
-    await syncShotRange();
   }
 
   async function move(fromIndex: number, toIndex: number) {
     await frameStore.move(fromIndex, toIndex);
-    await syncShotRange();
   }
 
   /**
-   * 帧序变化后重算镜头的帧区间与时长。
+   * 手动「重算时长」：按当前帧条目数重算镜头帧区间与时长。
    * 帧区间与条带上的帧条目一一对应（结束帧号 = 起始帧号 + 帧条目数 - 1），
-   * 时长 = 帧条目数 ÷ 帧率；新增帧即延长本段，删除帧即缩短本段。
+   * 时长 = 帧条目数 ÷ 帧率。帧条目的增删改已在 frameStore.persist 的同一事务里
+   * 回写帧区间 / 时长 / 修订号，这里再触发一次并发保护的保存即可。
    */
   async function syncShotRange() {
     if (shotId.value === null) return;
-    const current = shotStore.byId(shotId.value);
-    if (!current) return;
-    const fps = current.fps || 24;
-    const count = Math.max(1, frames.value.length);
-    const seconds = Math.round((count / fps) * 1000) / 1000;
-    await shotStore.update(shotId.value, {
-      durationSec: seconds,
-      startFrame: current.startFrame,
-      endFrame: current.startFrame + count - 1,
-    });
+    await frameStore.persist();
   }
 
   /** 条带上的单帧曝光/位移改动 */

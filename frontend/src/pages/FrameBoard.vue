@@ -17,6 +17,7 @@ import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import ConflictDialog from '../components/common/ConflictDialog.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
@@ -70,6 +71,19 @@ function flash(text: string) {
   window.setTimeout(() => {
     if (feedback.value === text) feedback.value = '';
   }, 3200);
+}
+
+async function onResolve(resolution: Parameters<typeof frameStore.resolveConflicts>[0]) {
+  await frameStore.resolveConflicts(resolution);
+  if (frameStore.saveStatus === 'error') {
+    flash(frameStore.saveError || '保存失败，已恢复原帧序');
+  } else {
+    flash('已按选择合并并保存帧序');
+  }
+}
+
+function onDismissConflicts() {
+  frameStore.dismissConflicts();
 }
 
 async function doInsert() {
@@ -149,6 +163,12 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
 
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
+      <p v-if="frameStore.saveStatus === 'error' && frameStore.saveError" class="feedback error" data-testid="board-save-error">
+        保存失败，已恢复原帧序：{{ frameStore.saveError }}
+      </p>
+      <p v-if="frameStore.hasConflicts" class="feedback conflict" data-testid="board-conflict-hint">
+        帧序与其它标签页的改动冲突，请在下方弹窗中选择保留的帧与字段。
+      </p>
 
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
@@ -237,6 +257,13 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <p class="muted">按帧率 {{ fps }} fps 计算，当前帧序等效时长 {{ framesToDuration(ordered.length, fps) }} s。</p>
       </div>
     </template>
+
+    <ConflictDialog
+      :visible="frameStore.saveStatus === 'conflict'"
+      :conflicts="frameStore.conflicts"
+      @resolve="onResolve"
+      @cancel="onDismissConflicts"
+    />
   </section>
 </template>
 
@@ -422,5 +449,15 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.feedback.error {
+  background: #fdecec;
+  border-color: #f5c6c6;
+  color: #c0392b;
+}
+.feedback.conflict {
+  background: #fff4e5;
+  border-color: #f5d9a8;
+  color: #b25e09;
 }
 </style>

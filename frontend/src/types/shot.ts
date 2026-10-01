@@ -27,6 +27,11 @@ export interface Shot {
   owner: string;
   /** 完成百分比快照（由实拍记录回写，0-100） */
   progressPercent: number;
+  /**
+   * 帧序修订号：每次帧条目保存（插入 / 删除 / 移动 / 改参数）自增。
+   * 打开镜头时记录，保存前与本地库核对，不一致即说明有其它标签页先保存过。
+   */
+  revision: number;
   /** 创建时间戳 */
   createdAt: number;
   updatedAt: number;
@@ -42,6 +47,7 @@ export const createEmptyShot = (): Shot => ({
   status: '未开机',
   owner: '',
   progressPercent: 0,
+  revision: 1,
   createdAt: Date.now(),
   updatedAt: Date.now(),
 });

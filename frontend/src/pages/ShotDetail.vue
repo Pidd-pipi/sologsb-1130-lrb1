@@ -23,6 +23,7 @@ import ExposureForm from '../components/common/ExposureForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import ConflictDialog from '../components/common/ConflictDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -88,6 +89,19 @@ function flash(text: string) {
   window.setTimeout(() => {
     if (feedback.value === text) feedback.value = '';
   }, 3200);
+}
+
+async function onResolve(resolution: Parameters<typeof frameStore.resolveConflicts>[0]) {
+  await frameStore.resolveConflicts(resolution);
+  if (frameStore.saveStatus === 'error') {
+    flash(frameStore.saveError || '保存失败，已恢复原帧序');
+  } else {
+    flash('已按选择合并并保存帧序');
+  }
+}
+
+function onDismissConflicts() {
+  frameStore.dismissConflicts();
 }
 
 async function changeStatus(status: ShotStatus) {
@@ -227,6 +241,12 @@ function speedOf(frame: FrameEntry) {
 
     <template v-else-if="shot">
       <p v-if="feedback" class="feedback" data-testid="detail-feedback">{{ feedback }}</p>
+      <p v-if="frameStore.saveStatus === 'error' && frameStore.saveError" class="feedback error" data-testid="detail-save-error">
+        保存失败，已恢复原帧序：{{ frameStore.saveError }}
+      </p>
+      <p v-if="frameStore.hasConflicts" class="feedback conflict" data-testid="detail-conflict-hint">
+        帧序与其它标签页的改动冲突，请在下方弹窗中选择保留的帧与字段。
+      </p>
 
       <div class="panel">
         <div class="panel-head"><h2>镜头参数与进度</h2></div>
@@ -412,6 +432,13 @@ function speedOf(frame: FrameEntry) {
         <EmptyState v-else title="还没有道具状态" description="填写道具名与帧区间后登记，即可在帧序条带上按帧查询位置。" />
       </div>
     </template>
+
+    <ConflictDialog
+      :visible="frameStore.saveStatus === 'conflict'"
+      :conflicts="frameStore.conflicts"
+      @resolve="onResolve"
+      @cancel="onDismissConflicts"
+    />
   </section>
 </template>
 
@@ -619,5 +646,15 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.feedback.error {
+  background: #fdecec;
+  border-color: #f5c6c6;
+  color: #c0392b;
+}
+.feedback.conflict {
+  background: #fff4e5;
+  border-color: #f5d9a8;
+  color: #b25e09;
 }
 </style>
