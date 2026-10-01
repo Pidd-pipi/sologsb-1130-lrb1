@@ -4,6 +4,7 @@
  *   v1 建 shots / frames
  *   v2 增加 props 表与 shotId 索引
  *   v3 增加 takes 表，并按实拍张数回填进度
+ *   v4 为镜头增加帧序修订号，支持多标签页乐观并发保存
  */
 import Dexie from 'dexie';
 import type { Table } from 'dexie';
@@ -72,6 +73,22 @@ export class StopMotionDb extends Dexie {
           const percent = Math.min(100, Math.round((take.takenFrames / total) * 100));
           await tx.table('takes').update(take.id, { percent });
         }
+      });
+    this.version(4)
+      .stores({
+        shots: '++id, code, status, sceneName',
+        frames: '++id, shotId, frameNo, [shotId+frameNo]',
+        props: '++id, shotId, name, [shotId+fromFrame]',
+        takes: '++id, shotId, date, shotCode',
+      })
+      .upgrade(async (tx) => {
+        // v4：帧序修订号从 1 开始；后续只有帧条目或帧区间变化才递增
+        await tx
+          .table('shots')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.frameRevision !== 'number') row.frameRevision = 1;
+          });
       });
   }
 }

@@ -6,7 +6,6 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
-import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
@@ -17,15 +16,38 @@ import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import FrameConflictPanel from '../components/common/FrameConflictPanel.vue';
+import type { FrameConflictResolution } from '../types/frameMerge';
 
 const shotStore = useShotStore();
-const frameStore = useFrameStore();
 const { shots } = storeToRefs(shotStore);
-const { frames, selectedFrameNo } = storeToRefs(frameStore);
-const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration, fps } = useFrameSequence();
+const {
+  frames,
+  selectedFrameNo,
+  insertAfter,
+  removeAt,
+  move,
+  patch,
+  applyBatch,
+  select,
+  syncShotRange,
+  save,
+  discard,
+  resolutionFromChoices,
+  totalDuration,
+  fps,
+  dirty,
+  saving,
+  conflict,
+  saveError,
+  baseRevision,
+  currentRevision,
+  reload,
+} = useFrameSequence();
 
 const activeShotId = ref<number | null>(null);
 const feedback = ref('');
+const conflictChoices = ref<Record<number, FrameConflictResolution | undefined>>({});
 const newFrame = ref<Partial<FrameEntry>>({
   shotCount: 2,
   exposureSec: 0.25,
@@ -57,12 +79,13 @@ onMounted(async () => {
   const first = shots.value[0];
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
-    await frameStore.loadForShot(first.id);
+    await reload(first.id);
   }
 });
 
 watch(activeShotId, async (id) => {
-  if (typeof id === 'number') await frameStore.loadForShot(id);
+  conflictChoices.value = {};
+  if (typeof id === 'number') await reload(id);
 });
 
 function flash(text: string) {
@@ -74,13 +97,13 @@ function flash(text: string) {
 
 async function doInsert() {
   if (activeShotId.value === null) return;
-  await insertAfter(selectedFrameNo.value);
+  insertAfter(selectedFrameNo.value);
   const created = frames.value.find((f) => f.frameNo === (selectedFrameNo.value ?? 0) + 1) ?? frames.value[frames.value.length - 1];
   if (created) {
-    await patch(created.frameNo, newFrame.value);
+    patch(created.frameNo, newFrame.value);
     select(created.frameNo);
   }
-  flash('已插入一帧并重排序号');
+  flash('已在本地插入一帧，点击「保存帧序」后生效');
 }
 
 async function doRemove() {
@@ -88,19 +111,54 @@ async function doRemove() {
     flash('请先点选要删除的帧');
     return;
   }
-  await removeAt(selectedFrameNo.value);
-  flash('已删除该帧并重排序号');
+  removeAt(selectedFrameNo.value);
+  flash('已在本地删除，点击「保存帧序」后生效');
 }
 
-async function doReorder(from: number, to: number) {
-  await move(from, to);
-  flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位`);
+function doReorder(from: number, to: number) {
+  move(from, to);
+  flash(`已在本地把第 ${from + 1} 个色块移动到第 ${to + 1} 位，保存后生效`);
+}
+
+async function saveFrameEdits() {
+  try {
+    const result = await save();
+    if (conflict.value) {
+      conflictChoices.value = {};
+      flash(conflict.value.message);
+    } else if (result) {
+      flash(`帧序已保存，修订号更新为 r${result.revision}`);
+    } else {
+      flash('当前没有待保存的帧序修改');
+    }
+  } catch {
+    flash(saveError.value || '帧序保存失败，已恢复原帧序');
+  }
+}
+
+async function confirmFrameConflicts() {
+  if (!conflict.value) return;
+  try {
+    const result = await save(resolutionFromChoices(conflictChoices.value));
+    if (result) {
+      conflictChoices.value = {};
+      flash(`冲突已处理，帧序一次性保存，修订号 r${result.revision}`);
+    }
+  } catch {
+    flash(saveError.value || '帧序保存失败，已恢复原帧序');
+  }
+}
+
+function discardFrameEdits() {
+  discard();
+  conflictChoices.value = {};
+  flash('已放弃本地编辑并恢复原帧序');
 }
 
 async function doBatch() {
   if (activeShotId.value === null) return;
-  await frameStore.applyBatch({ ...batch.value });
-  flash('已对全部帧批量套用曝光参数');
+  applyBatch({ ...batch.value });
+  flash('已在本地批量套用曝光参数，点击「保存帧序」后生效');
 }
 
 async function doBatchSelectedOnly() {
@@ -109,8 +167,8 @@ async function doBatchSelectedOnly() {
     return;
   }
   const index = ordered.value.findIndex((f) => f.frameNo === selectedFrameNo.value);
-  await frameStore.applyBatch({ ...batch.value }, [index]);
-  flash('已对选中帧套用曝光参数');
+  applyBatch({ ...batch.value }, [index]);
+  flash('已在选中帧套用曝光参数，保存后生效');
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
@@ -150,18 +208,32 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
 
+      <FrameConflictPanel
+        v-if="conflict"
+        :merge="conflict"
+        v-model:choices="conflictChoices"
+        :saving="saving"
+        @confirm="confirmFrameConflicts"
+        @discard="discardFrameEdits"
+      />
+
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
         <div class="stat"><span class="label">条带帧数</span><span class="value">{{ frames.length }}</span></div>
         <div class="stat"><span class="label">计划张数</span><span class="value">{{ planned }}</span></div>
         <div class="stat"><span class="label">当前时长</span><span class="value small">{{ totalDuration }} s</span></div>
         <div class="stat"><span class="label">帧率</span><span class="value small">{{ fps }} fps</span></div>
+        <div class="stat"><span class="label">修订号</span><span class="value small">r{{ currentRevision }}<span v-if="dirty"> · 待保存</span></span></div>
       </div>
 
       <div class="panel">
         <div class="panel-head">
           <h2>帧序条带</h2>
           <div class="head-actions">
+            <button type="button" class="btn small primary" data-testid="board-save" :disabled="!dirty || saving" @click="saveFrameEdits">
+              {{ saving ? '保存中…' : '保存帧序' }}
+            </button>
+            <button type="button" class="btn small" :disabled="!dirty || saving" @click="discardFrameEdits">恢复原帧序</button>
             <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入帧</button>
             <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">删除选中帧</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>

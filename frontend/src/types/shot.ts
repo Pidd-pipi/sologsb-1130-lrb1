@@ -25,6 +25,8 @@ export interface Shot {
   status: ShotStatus;
   /** 负责人 */
   owner: string;
+  /** 帧序乐观锁修订号；打开镜头时记录，保存帧序时核对 */
+  frameRevision: number;
   /** 完成百分比快照（由实拍记录回写，0-100） */
   progressPercent: number;
   /** 创建时间戳 */
@@ -41,6 +43,7 @@ export const createEmptyShot = (): Shot => ({
   endFrame: 48,
   status: '未开机',
   owner: '',
+  frameRevision: 1,
   progressPercent: 0,
   createdAt: Date.now(),
   updatedAt: Date.now(),

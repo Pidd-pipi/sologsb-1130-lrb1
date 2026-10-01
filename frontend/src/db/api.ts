@@ -4,9 +4,106 @@ import type { Shot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
 import type { PropState } from '../types/prop';
 import type { TakeLog } from '../types/take';
+import { framesToDuration } from '../utils/frameMath';
+import { mergeFrameSnapshots, type MergeResolutions } from '../utils/frameMerge';
+import type { FrameMergeResult } from '../types/frameMerge';
 
 export async function initDb(): Promise<void> {
   if (!db.isOpen()) await db.open();
+}
+
+/** 保存时帧序修订号已变化：调用方需要展示冲突，不能继续写入旧快照 */
+export class StaleFrameRevisionError extends Error {
+  merge: FrameMergeResult;
+
+  constructor(merge: FrameMergeResult) {
+    super('帧序修订号已过期');
+    this.name = 'StaleFrameRevisionError';
+    this.merge = merge;
+  }
+}
+
+export interface CommitFrameSequenceInput {
+  shotId: number;
+  expectedRevision: number;
+  baseFrames: FrameEntry[];
+  localFrames: FrameEntry[];
+  /** 用户在冲突面板中看到的远端修订号，重试时必须仍为当前值 */
+  expectedCurrentRevision?: number;
+  resolutions?: MergeResolutions;
+}
+
+export interface CommitFrameSequenceResult {
+  shot: Shot;
+  frames: FrameEntry[];
+  revision: number;
+  merge: FrameMergeResult;
+}
+
+/**
+ * 一次性提交帧序：核对修订号、必要时三方合并，再在同一事务中替换帧条目、
+ * 更新镜头帧区间/时长并递增修订号。事务中止时 IndexedDB 自动回滚原帧序。
+ */
+export async function commitFrameSequence(input: CommitFrameSequenceInput): Promise<CommitFrameSequenceResult> {
+  const resolutions = input.resolutions ?? {};
+  const hasResolutions = Object.keys(resolutions).length > 0;
+  const timestamp = Date.now();
+
+  return db.transaction('rw', db.shots, db.frames, async () => {
+    const shot = await db.shots.get(input.shotId);
+    if (!shot) throw new Error('镜头不存在，无法保存帧序');
+
+    const remoteFrames = await db.frames.where('shotId').equals(input.shotId).toArray();
+    remoteFrames.sort((a, b) => a.frameNo - b.frameNo);
+    const currentRevision = shot.frameRevision ?? 1;
+
+    const basePlain = toPlain(input.baseFrames);
+    const localPlain = toPlain(input.localFrames);
+    const merge = mergeFrameSnapshots(basePlain, localPlain, remoteFrames, input.expectedRevision, currentRevision, resolutions);
+
+    const revisionMovedDuringReview =
+      hasResolutions &&
+      typeof input.expectedCurrentRevision === 'number' &&
+      input.expectedCurrentRevision !== currentRevision;
+
+    if (currentRevision !== input.expectedRevision && merge.status === 'conflict' && (!hasResolutions || revisionMovedDuringReview)) {
+      throw new StaleFrameRevisionError(merge);
+    }
+
+    const startFrame = Number.isFinite(shot.startFrame) && shot.startFrame >= 1 ? Math.floor(shot.startFrame) : 1;
+    const frames = merge.mergedFrames.map((frame, index) => {
+      const stored = toPlain({
+        ...frame,
+        id: typeof frame.id === 'number' && frame.id > 0 ? frame.id : undefined,
+        shotId: input.shotId,
+        frameNo: startFrame + index,
+        updatedAt: timestamp,
+      });
+      return stored;
+    });
+
+    await db.frames.where('shotId').equals(input.shotId).delete();
+    if (frames.length) await db.frames.bulkAdd(frames);
+
+    const nextRevision = currentRevision + 1;
+    const durationSec = framesToDuration(Math.max(1, frames.length), shot.fps);
+    const nextShot: Shot = {
+      ...shot,
+      startFrame,
+      endFrame: startFrame + Math.max(1, frames.length) - 1,
+      durationSec,
+      frameRevision: nextRevision,
+      updatedAt: timestamp,
+    };
+    await db.shots.put(toPlain(nextShot));
+
+    return {
+      shot: nextShot,
+      frames: await db.frames.where('shotId').equals(input.shotId).toArray(),
+      revision: nextRevision,
+      merge,
+    };
+  });
 }
 
 /* ---------------- shots ---------------- */
@@ -25,7 +122,15 @@ export async function addShot(shot: Shot): Promise<number> {
 }
 
 export async function updateShot(id: number, patch: Partial<Shot>): Promise<void> {
-  await db.shots.update(id, toPlain({ ...patch, updatedAt: Date.now() }));
+  const { frameRevision, ...rest } = patch;
+  await db.shots.update(
+    id,
+    toPlain({
+      ...rest,
+      ...(typeof frameRevision === 'number' ? { frameRevision } : {}),
+      updatedAt: Date.now(),
+    }),
+  );
 }
 
 export async function deleteShot(id: number): Promise<void> {

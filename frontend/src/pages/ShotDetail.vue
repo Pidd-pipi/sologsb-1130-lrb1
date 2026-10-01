@@ -6,9 +6,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
-import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
 import * as api from '../db/api';
@@ -23,14 +21,32 @@ import ExposureForm from '../components/common/ExposureForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import FrameConflictPanel from '../components/common/FrameConflictPanel.vue';
+import type { FrameConflictResolution } from '../types/frameMerge';
 
 const route = useRoute();
 const router = useRouter();
 const shotStore = useShotStore();
-const frameStore = useFrameStore();
-const { frames, selectedFrameNo } = storeToRefs(frameStore);
-
-const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
+const {
+  frames,
+  selectedFrameNo,
+  insertAfter,
+  removeAt,
+  move,
+  patch,
+  select,
+  syncShotRange,
+  save,
+  discard,
+  resolutionFromChoices,
+  dirty,
+  saving,
+  conflict,
+  saveError,
+  baseRevision,
+  currentRevision,
+  reload,
+} = useFrameSequence();
 const { registerTake, summaries, loadTakes, computeProgress } = useProgress();
 
 const props = ref<PropState[]>([]);
@@ -38,6 +54,7 @@ const takeForm = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
 const propForm = ref({ name: '', fromFrame: 1, toFrame: 12, posX: 0, posY: 0, posZ: 0, rotation: 0, fixation: '支架' as Fixation });
 const exposureDraft = ref<Partial<FrameEntry>>({});
 const feedback = ref('');
+const conflictChoices = ref<Record<number, FrameConflictResolution | undefined>>({});
 const notFound = ref(false);
 
 const shotId = computed(() => Number(route.params.id));
@@ -59,7 +76,8 @@ async function bootstrap(id: number) {
     return;
   }
   notFound.value = false;
-  await frameStore.loadForShot(id);
+  conflictChoices.value = {};
+  await reload(id);
   await loadTakes();
   props.value = await api.listProps(id);
   if (typeof row.id === 'number') shotStore.currentId = row.id;
@@ -116,12 +134,46 @@ async function addFrameWithExposure() {
     await patch(last.frameNo, exposureDraft.value as Partial<FrameEntry>);
     select(last.frameNo);
   }
-  flash('已在帧序中插入一帧');
+  flash('已在本地帧序插入一帧，点击「保存帧序」后生效');
 }
 
 async function reorder(from: number, to: number) {
-  await move(from, to);
-  flash('已移动帧并重排序号');
+  move(from, to);
+}
+
+async function saveFrameEdits() {
+  try {
+    const result = await save();
+    if (conflict.value) {
+      conflictChoices.value = {};
+      flash(conflict.value.message);
+    } else if (result) {
+      flash(`帧序已保存，修订号更新为 r${result.revision}`);
+    } else {
+      flash('当前没有待保存的帧序修改');
+    }
+  } catch {
+    flash(saveError.value || '帧序保存失败，已恢复原帧序');
+  }
+}
+
+async function confirmFrameConflicts() {
+  if (!conflict.value) return;
+  try {
+    const result = await save(resolutionFromChoices(conflictChoices.value));
+    if (result) {
+      conflictChoices.value = {};
+      flash(`冲突已处理，帧序一次性保存，修订号 r${result.revision}`);
+    }
+  } catch {
+    flash(saveError.value || '帧序保存失败，已恢复原帧序');
+  }
+}
+
+function discardFrameEdits() {
+  discard();
+  conflictChoices.value = {};
+  flash('已放弃本地编辑并恢复原帧序');
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
@@ -134,8 +186,8 @@ async function editCell(frame: FrameEntry, key: keyof FrameEntry, raw: string, n
 }
 
 async function removeFrameRow(frameNo: number) {
-  await removeAt(frameNo);
-  flash('已删除该帧并重排序号');
+  removeAt(frameNo);
+  flash('已从本地帧序删除，点击「保存帧序」后生效');
 }
 
 async function submitTake() {
@@ -208,7 +260,7 @@ function speedOf(frame: FrameEntry) {
           镜头详情
           <span v-if="shot" class="mono">{{ shot.code }}</span>
         </h1>
-        <p class="sub" v-if="shot">{{ shot.sceneName }} · {{ shot.fps }} fps · 帧区间 {{ shot.startFrame }} – {{ shot.endFrame }}</p>
+        <p class="sub" v-if="shot">{{ shot.sceneName }} · {{ shot.fps }} fps · 帧区间 {{ shot.startFrame }} – {{ shot.endFrame }} · 修订号 r{{ currentRevision }}<span v-if="dirty"> · 待保存</span></p>
       </div>
       <div class="head-actions">
         <StatusTag v-if="shot" :status="shot.status" />
@@ -227,6 +279,15 @@ function speedOf(frame: FrameEntry) {
 
     <template v-else-if="shot">
       <p v-if="feedback" class="feedback" data-testid="detail-feedback">{{ feedback }}</p>
+
+      <FrameConflictPanel
+        v-if="conflict"
+        :merge="conflict"
+        v-model:choices="conflictChoices"
+        :saving="saving"
+        @confirm="confirmFrameConflicts"
+        @discard="discardFrameEdits"
+      />
 
       <div class="panel">
         <div class="panel-head"><h2>镜头参数与进度</h2></div>
@@ -305,6 +366,10 @@ function speedOf(frame: FrameEntry) {
         <div class="panel-head">
           <h2>帧条目表格</h2>
           <div class="head-actions">
+            <button type="button" class="btn small primary" data-testid="save-frame-sequence" :disabled="!dirty || saving" @click="saveFrameEdits">
+              {{ saving ? '保存中…' : '保存帧序' }}
+            </button>
+            <button type="button" class="btn small" :disabled="!dirty || saving" @click="discardFrameEdits">恢复原帧序</button>
             <button type="button" class="btn small" data-testid="insert-frame" @click="addFrameWithExposure">插入帧</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>

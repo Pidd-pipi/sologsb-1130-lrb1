@@ -56,6 +56,7 @@ export const useShotStore = defineStore('shot', {
         startFrame: range.startFrame,
         endFrame: range.endFrame,
         progressPercent: 0,
+        frameRevision: 1,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
@@ -65,7 +66,7 @@ export const useShotStore = defineStore('shot', {
       this.currentId = id;
       return saved;
     },
-    /** 改时长/帧率后重排帧区间，并同步到该镜头的全部帧条目 */
+    /** 改镜头元数据；帧条目统一走带修订号的帧序保存，避免在这里覆盖另一标签页 */
     async update(id: number, patch: Partial<Shot>) {
       const existing = this.shots.find((s) => s.id === id);
       if (!existing) return;
@@ -75,18 +76,15 @@ export const useShotStore = defineStore('shot', {
       next.endFrame = range.endFrame;
       await api.updateShot(id, next);
       this.shots = this.shots.map((s) => (s.id === id ? { ...next, id } : s));
-      await this.rerangeFrames(id);
     },
-    /** 把帧序号重新压缩进 [startFrame, endFrame]，并重算时长 */
-    async rerangeFrames(shotId: number) {
-      const shot = this.shots.find((s) => s.id === shotId);
-      if (!shot) return;
-      const rows = await api.listFrames(shotId);
-      const next = rows
-        .slice()
-        .sort((a, b) => a.frameNo - b.frameNo)
-        .map((row, idx) => ({ ...row, frameNo: shot.startFrame + idx }));
-      await api.updateFrames(next);
+    async upsert(shot: Shot) {
+      if (typeof shot.id !== 'number') return;
+      const idx = this.shots.findIndex((s) => s.id === shot.id);
+      if (idx === -1) {
+        this.shots = [...this.shots, shot].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'));
+      } else {
+        this.shots = this.shots.map((s) => (s.id === shot.id ? shot : s));
+      }
     },
     async setStatus(id: number, status: Shot['status']) {
       await api.updateShot(id, { status });
